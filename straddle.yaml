@@ -1,0 +1,174 @@
+# spangap-ble — the Bluetooth Low Energy stack owner.
+#
+# NimBLE initialises once, advertises from one legacy instance, holds one bond
+# store and one connection budget. Those are single resources, so one straddle
+# owns them and every Bluetooth feature is a consumer of ble.h — the same
+# relation spangap-net has with the Wi-Fi radio.
+#
+# Nothing in here knows what rides the link: no Reticulum, no RNode, no rnsd.
+# It knows that a consumer wants a service advertised and connections accounted
+# for, and nothing about what they carry.
+schema_version: 1
+name: spangap/spangap-ble
+prefix: ble
+version: 0.0.0
+firmware: esp-idf
+platforms: [idf]
+
+# Boot-registered service: BleService::onInit() seeds the defaults, registers
+# the `ble` CLI verbs and spawns the ble task. The Bluetooth HOST is not
+# started here — it starts on the first bleUp() from a consumer, so a build that
+# stages this straddle without using it costs flash and nothing else.
+services:
+  - { class: BleService, header: ble.h }
+
+# The Bluetooth controller + NimBLE host. These are the values, not the schema —
+# the option definitions live in IDF's own components/bt Kconfig. Two straddles
+# setting the same symbol is warned about at build time, which is one of the
+# reasons this block belongs to exactly one straddle.
+kconfig:
+  - CONFIG_BT_ENABLED=y
+  # NimBLE, not Bluedroid: smaller, BLE-only, and nothing either consumer needs
+  # is Bluedroid-exclusive. Every board here is an ESP32-S3, which has no
+  # Bluetooth Classic radio at all.
+  - CONFIG_BT_NIMBLE_ENABLED=y
+  # Both roles, both halves. A consumer may scan and dial (central/observer) and
+  # be dialled (peripheral/broadcaster) at the same time.
+  - CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+  - CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
+  - CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+  - CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+  # The connection budget bleSlotReserve() hands out (IDF default 3, range
+  # 1-9). Four, not the protocol's eight: the controller's internal-DRAM
+  # appetite — above all its exchange-memory arena, which scales with the
+  # activity count — is what a full reticulous image cannot afford beside
+  # Wi-Fi, and four connections (three mesh peers + the RNode door, or four
+  # peers with the door off) is the budget the S3 actually carries.
+  - CONFIG_BT_NIMBLE_MAX_CONNECTIONS=4
+  # Controller activities: connections + advertising + scanning, each costing
+  # internal DRAM in the controller heap AND the exchange arena. 4 + 1 + 1.
+  - CONFIG_BT_CTRL_BLE_MAX_ACT=6
+  # Two CCC descriptors per peer, with room (IDF default 8).
+  - CONFIG_BT_NIMBLE_MAX_CCCDS=16
+  # The RNode client asks for an ATT MTU of 512 and treats a failure as fatal
+  # and permanent, so the preferred MTU must be well clear of it (default 256).
+  - CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=517
+  # Bonds survive a reboot, which is the whole point of the pairing window —
+  # but NOT via NVS: the NVS backend writes internal flash synchronously on
+  # whatever task pairs or forgets, outside the platform's wear policy and its
+  # /state backups. With this off, NimBLE's stock store is RAM-only and
+  # ble_store.cpp persists it to /state/ble/bonds.bin instead, so bonds ride
+  # backups and factory resets like everything else durable.
+  - "# CONFIG_BT_NIMBLE_NVS_PERSIST is not set"
+  # The radio PHY re-calibrates in full at first radio start instead of
+  # persisting calibration to NVS — the other synchronous internal-flash
+  # writer on the BLE path (shared with Wi-Fi; the same switch covers both).
+  # Costs ~100-200 ms once per boot.
+  - "# CONFIG_ESP_PHY_CALIBRATION_AND_DATA_STORAGE is not set"
+  - CONFIG_BT_NIMBLE_MAX_BONDS=8
+  - CONFIG_BT_NIMBLE_SM_SC=y
+  # The host's allocations come from PSRAM; every board here has it. The
+  # controller's do not — those are internal-DRAM-only whatever this says.
+  - CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
+  # A consumer's GATT access callback and the inbound-notification hand-off both
+  # flatten an ATT value on the host task's stack, and at the preferred MTU that
+  # value reaches 512 bytes. The IDF default of 4096 has no room for it.
+  - CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=6144
+  # The controller carries ~22 KB of mandatory IRAM (libbtdm_app + libbt +
+  # libbtbb), and IRAM and DRAM come out of the same internal SRAM — enough to
+  # push boot below the CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL pool it must
+  # still fit (that dial is spangap-core's and tracks the whole image). So this
+  # straddle pays the controller's way by moving flash-safe code out of IRAM;
+  # the trade only applies while the controller is staged, which is exactly
+  # when the RAM is needed. Non-ISR functions only — everything moved is code
+  # that never runs with the flash cache off.
+  #
+  # CONFIG_SPI_FLASH_ROM_IMPL and CONFIG_HEAP_PLACE_FUNCTION_INTO_FLASH would
+  # buy ~20 KB more and must NOT be added: both sit on the erase path, and the
+  # ROM flash driver dies mid-way through the first-boot 8 MB /state format —
+  # a silent watchdog reset with the console gone.
+  - CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y
+  - CONFIG_RINGBUF_PLACE_FUNCTIONS_INTO_FLASH=y
+  # Wi-Fi's optional IRAM placement goes back to flash too — worth ~30 KB.
+  # This trades some Wi-Fi throughput, which is the right side of the trade on
+  # a build where Bluetooth and Wi-Fi already split the 2.4 GHz airtime; it is
+  # safe because Wi-Fi code never runs while the flash cache is off.
+  - "# CONFIG_ESP_WIFI_IRAM_OPT is not set"
+  - "# CONFIG_ESP_WIFI_RX_IRAM_OPT is not set"
+  # And Wi-Fi's dynamic buffers move to PSRAM. Without this the Wi-Fi driver
+  # demands internal DRAM for every dynamic RX/TX buffer, and with the BT
+  # controller's runtime pool beside it the internal heap runs dry under load —
+  # the Wi-Fi driver floods "m f null" and the next internal-DMA consumer (the
+  # LCD's SPI transfer) dies on a failed allocation. Espressif's own BT+Wi-Fi
+  # coexistence guidance for PSRAM boards. Needs CONFIG_SPIRAM_USE_MALLOC,
+  # which the platform already sets.
+  - CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+  # LWIP's optional IRAM placement goes back to flash as well — ~13 KB. The
+  # same trade as the Wi-Fi IRAM lines above: some TCP throughput, bought for
+  # heap the BLE controller cannot exist without.
+  - "# CONFIG_LWIP_IRAM_OPTIMIZATION is not set"
+  # The bounce pool that copies PSRAM TX buffers into DMA-able internal
+  # memory. Its default of 32 can hold ~51 KB of internal under TX load —
+  # more than the 16 internal dynamic buffers it replaced ever did; 16 keeps
+  # the worst case where it was.
+  - CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM=16
+  # The controller's init needs its ~50 KB block from the same internal pool
+  # Wi-Fi buffers live in, so Wi-Fi's buffering comes down to Espressif's own
+  # coexistence numbers: 4 static RX buffers (DMA, ~1.6 KB each), block-ack
+  # windows of 6 both ways, and half the management short-buffer pool. The
+  # cost is Wi-Fi burst throughput, not correctness.
+  - CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+  - CONFIG_ESP_WIFI_RX_BA_WIN=6
+  - CONFIG_ESP_WIFI_TX_BA_WIN=6
+  - CONFIG_ESP_WIFI_MGMT_SBUF_NUM=16
+
+# Declarative settings: both surfaces + storage defaults generated from here.
+# The node is top-level and unowned; order 12 slots it between net (10) and
+# reticulum (15). Consumers contribute their own rows to their own panes and
+# keep their KEYS under this straddle's s.ble.* namespace, so an operator sees
+# one Bluetooth namespace whatever pane a row sits in.
+settings:
+  - at:
+      - { id: bluetooth, label: "Bluetooth", short: "BT", order: 12 }
+    rows:
+      - section: "Bluetooth"
+      - caption: "Bluetooth Low Energy. The radio starts only when something in this build asks for it, and stops when nothing does."
+      - switch: { label: "Enabled", key: "s.ble.enable", default: 0 }
+      - dropdown:
+          label: "Transmit power"
+          key: "s.ble.txpower"
+          default: 9
+          options:
+            - { v: 0,  l: "0 dBm" }
+            - { v: 3,  l: "+3 dBm" }
+            - { v: 6,  l: "+6 dBm" }
+            - { v: 9,  l: "+9 dBm" }
+            - { v: 12, l: "+12 dBm" }
+            - { v: 15, l: "+15 dBm" }
+            - { v: 18, l: "+18 dBm" }
+            - { v: 20, l: "+20 dBm" }
+      - section: "Pairing"
+      - caption: "A phone may only bond with this device while the pairing window is open. Bonds already made keep working; forget one to make the phone pair again."
+      # The sentinel is the ephemeral key `ble.pair` carrying the number of
+      # seconds — never `s.ble.pairing`: a dot-path write under a scalar would
+      # replace the scalar, and a sentinel is not configuration.
+      - buttons:
+          items:
+            - { label: "Pair for 60 s", do: { set: { key: "ble.pair", value: "60", edge: true } } }
+            - { label: "Close now",     do: { set: { key: "ble.pair", value: "0",  edge: true } } }
+      - value: { label: "Window", key: "ble.pairing_text" }
+      - button:
+          label: "Forget all bonds"
+          color: red
+          do:
+            dialog:
+              text: "Forget every paired device? Each one has to pair again."
+              buttons:
+                - { label: "Cancel" }
+                - { label: "Forget all", color: red, do: { set: { key: "ble.forget", value: "all", edge: true } } }
+      - section: "Status"
+      - info:
+          rows:
+            - value: { label: "State", key: "ble.state_text" }
+            - value: { label: "Peers", key: "ble.peers" }
+            - value: { label: "Bonds", key: "ble.bonds" }

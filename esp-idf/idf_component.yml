@@ -1,0 +1,9 @@
+description: "spangap-ble: the Bluetooth Low Energy stack owner (NimBLE host, advertising, bonds, connection budget)."
+url: https://github.com/spangap/spangap-ble
+version: "0.1.0"
+license: "Apache-2.0"
+targets:
+  - esp32s3
+dependencies:
+  idf:
+    version: ">=5.5"

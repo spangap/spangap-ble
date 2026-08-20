@@ -17,7 +17,7 @@ hostStart()                     ble task    nimble_port_init → ble_hs_cfg →
  ↓                                          nimble_port_freertos_init
 onHostSync()                    HOST task   set a flag, wake the ble task
  ↓
-hostSynced()                    ble task    set a random static address, BLE_EV_UP
+hostSynced()                    ble task    set a resolvable private address, BLE_EV_UP
  ↓ every pass, while up
 bleGapDrain()                   ble task    run what the host task queued
 bleAdvReconcile()               ble task    rotate the advertising claim
@@ -212,6 +212,17 @@ one large block, `hostStart` frees it into the controller's hands, and
 earmark defeats; the contiguous arena is guaranteed by construction, not
 hoped for. The earmark is only held when `s.ble.enable` was set at boot.
 
+The earmark is why this straddle's position in the init order does not
+matter: any `onInit` runs before the runtime's big internal-RAM spenders
+(Wi-Fi buffers, task stacks), so the grab lands in a near-virgin heap
+wherever it sits in the sequence — and the regrab at `hostStop` is what an
+early allocation could never give, contiguity for a restart hours into
+uptime when the heap is genuinely fragmented. The one ordering-related
+failure left is the grab itself failing under some future straddle's
+init-time internal-RAM appetite; it warns when it cannot get the block, and
+that warning appearing is the moment to revisit init order or size the
+controller from what was actually secured — not before.
+
 The controller also carries **~22 KB of mandatory IRAM** (libbtdm_app + libbt +
 libbtbb), and IRAM and DRAM share the same internal SRAM — so staging this
 straddle shrinks the boot-time internal heap, which must still fit
@@ -281,23 +292,33 @@ and the reconcile pass brings the scan back afterwards.
   `s_dialInFlight` gates the scan, all dialling and the address rotation, so
   a stuck flag paralyses all three — the dial watchdog in the task loop
   force-fails any dial still unresolved past its own timeout plus margin.
-- **The address is a non-resolvable private address and rotates on every
-  disconnect.** A fresh one is generated at every host start, after every
-  disconnect (`bleAddrRotateDue()`, marked in the gap drain), and at latest
-  every `BLE_ADDR_ROTATE_MS` while idle, so stale per-address state on a peer
-  can never match this device twice — the per-connection freshness phones get
-  from their radios, achieved sequentially with the one address slot this
-  stack has. Non-resolvable, not random static, for the top bits: 00
-  sorts below every phone's resolvable private address (01), which an
-  address-comparison role election needs to take the dialling side against
-  phones — a random static address (11) loses that election every time. A
-  consumer that caches `bleOwnAddr()` must re-read it on every `BLE_EV_UP` —
-  one fires after each rotation. Rotation strands bonds (the peer recorded the
-  old address), which is accepted until resolvable-private-address privacy
-  with a persisted identity resolving key exists; the rotation itself stops
-  advertising and the scan and defers past any pending dial before
-  `ble_hs_id_set_rnd`, because the controller refuses the command while any of
-  them uses the address. Live connections keep running through it.
+- **The address is a resolvable private address and rotates on every
+  disconnect.** A fresh one is derived from the persisted identity resolving
+  key at every host start, after every disconnect (`bleAddrRotateDue()`,
+  marked in the gap drain), and at latest every `BLE_ADDR_ROTATE_MS` while
+  idle, so stale per-address state on a peer can never match this device
+  twice — the per-connection freshness phones get from their radios, achieved
+  sequentially with the one address slot this stack has. A **bonded** peer
+  receives the key at SMP key exchange and resolves every rotation back to
+  one identity (the chip's public address, which is what the bond records),
+  so bonds survive rotation and reboot; the key persists with the bonds in
+  `/state/ble/bonds.bin`, because a lost key strands every bond silently.
+  Generation is esp-nimble's HOST-based privacy — forced on via
+  `esp-idf/project_include.cmake`, since the Kconfig gates it to the original
+  ESP32 — precisely so the address stays under this task's control and
+  readable: the S3's controller-side engine would mint RPAs the host cannot
+  see, and only once the resolving list is non-empty at all. NimBLE's own
+  privacy timer also regenerates the RPA (`BT_NIMBLE_RPA_TIMEOUT`, 900 s);
+  the reconcile pass polls for that and adopts the new value. A consumer that
+  caches `bleOwnAddr()` must re-read it on every `BLE_EV_UP` — one fires
+  after each change, either source. The election cost: an RPA's top bits are
+  01, the same as every phone's, so the address-comparison role election is a
+  coin flip against phones per rotation window (the old non-resolvable 00
+  always won it). If privacy fails to start, the old non-resolvable
+  generation is the fallback — fresh addresses, stranded bonds. The rotation
+  itself stops advertising and the scan and defers past any pending dial
+  before setting the address, because the controller refuses the command
+  while any of them uses it. Live connections keep running through it.
 - **`ble_gatts_notify_custom` consumes its mbuf on every path**, success or
   failure. Bytes handed to it are gone, so a consumer that cannot afford to lose
   them must hold the chunk itself and re-send — see `rnode-ble`'s outbound carry.

@@ -49,7 +49,11 @@ static void cliBle(const char* args) {
                               : bleWanted() ? "starting" : "idle (nothing has asked)");
     if (s_hostUp) {
         bleFmtAddr(s_ownAddr, a, sizeof(a));
-        cliPrintf("address:  %s (public)\n", a);
+        const char* kind = s_ownAddrType == BLE_OWN_ADDR_PUBLIC ? "public"
+                         : (s_ownAddr[5] & 0xC0) == 0x40 ? "resolvable private"
+                         : (s_ownAddr[5] & 0xC0) == 0x00 ? "non-resolvable private"
+                                                         : "random static";
+        cliPrintf("address:  %s (%s)\n", a, kind);
     }
     cliPrintf("tx power: %d dBm\n", s_txPowerDbm);
     cliPrintf("conns:    %d of %d attached, %u since boot\n",
@@ -130,13 +134,22 @@ static void cliBleForget(const char* args) {
     cliPrintf(bleForget(addr) ? "dropped\n" : "no such bond\n");
 }
 
+/* Print the seen table; the shared tail of every `ble scan` form. */
+static void seenPrint(void);
+
 /* The debug scan reads the table the ble task keeps of everything the scanner
- * has heard, whoever asked for the scan. So `ble scan` starts the observer if
- * nobody else has, and is run again to read the results — no CLI command ever
- * blocks waiting for the radio, and running it alongside a consumer's own scan
- * shows exactly what that consumer is seeing. */
+ * has heard, whoever asked for the scan. `ble scan <seconds>` is the survey
+ * form: it borrows the one scanner outright for the window — active and
+ * unfiltered, because a consumer's scan is parameterised for its own hunt
+ * (passive, UUID-filtered, low duty) and shows a surveyor almost nothing —
+ * blocks the CLI for the window (the on-device rnprobe precedent), prints
+ * what was heard and hands back exactly the request that was running. Bare
+ * `ble scan` stays the non-blocking two-step: start the observer if nobody
+ * else has, run again to read the shared instrument. */
 static void cliBleScan(const char* args) {
     if (args && cliWantsHelp(args)) {
+        cliPrintf("%-*s survey for <s> seconds (active, unfiltered), then list\n",
+                  CLI_HELP_COL, "ble scan <s>");
         cliPrintf("%-*s show what the scanner has heard (starts it if idle)\n",
                   CLI_HELP_COL, "ble scan");
         cliPrintf("%-*s stop the debug scan and clear the table\n",
@@ -156,6 +169,27 @@ static void cliBleScan(const char* args) {
         return;
     }
 
+    int secs = args ? atoi(args) : 0;
+    if (secs > 0) {
+        if (secs > 30) secs = 30;
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        ble_scan_req_t prev = s_scanReq;
+        bool prevWanted     = s_scanWanted;
+        xSemaphoreGive(s_lock);
+        bleSeenClear();
+        ble_scan_req_t r = {};
+        r.activeScan = 1;          /* ask for scan responses, so names arrive */
+        r.intervalMs = 100;
+        r.windowMs   = 90;
+        bleScanStart(&r);
+        cliPrintf("surveying for %d s...\n", secs);
+        vTaskDelay(pdMS_TO_TICKS(secs * 1000));
+        if (prevWanted) bleScanStart(&prev);
+        else if (!s_cliWanted) bleScanStop();
+        seenPrint();
+        return;
+    }
+
     if (!s_scanWanted) {
         ble_scan_req_t r = {};
         r.activeScan = 1;          /* ask for scan responses, so names arrive */
@@ -168,6 +202,10 @@ static void cliBleScan(const char* args) {
         return;
     }
 
+    seenPrint();
+}
+
+static void seenPrint(void) {
     ble_seen_t seen[BLE_MAX_SEEN];
     int n = bleSeenList(seen, BLE_MAX_SEEN);
     if (!n) { cliPrintf("nothing heard yet\n"); return; }

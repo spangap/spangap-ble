@@ -54,12 +54,20 @@ static bool storeReady(void) {
 
 /* The layout stamp: NimBLE's structs are dumped raw, so a NimBLE upgrade that
  * resizes them must invalidate the file rather than misread it. Bonds are
- * re-creatable by pairing again; honesty beats migration code. */
+ * re-creatable by pairing again; honesty beats migration code. The header
+ * carries the local IRK entries too — the identity resolving key privacy
+ * derives every RPA from. Growing the header dropped every pre-privacy file
+ * on upgrade, which was correct rather than regrettable: those bonds were
+ * keyed to dead non-resolvable addresses. A lost IRK is worse than a lost
+ * bond — every peer holding the old one loses us silently — which is why it
+ * rides in this file, under the same write-`.new`-then-rename. */
 struct store_hdr_t {
     uint32_t magic;
     uint16_t secSize;
     uint16_t cccdSize;
-    uint8_t  nOur, nPeer, nCccd, pad;
+    uint16_t irkSize;
+    uint8_t  nOur, nPeer, nCccd, nIrk;
+    uint8_t  pad[2];
 };
 
 static uint32_t s_dirtyMs = 0;         /* 0 = clean; else millis() of the change */
@@ -79,10 +87,12 @@ static uint32_t snapshotHash(void) {
     int no = ble_store_config_num_our_secs;
     int np = ble_store_config_num_peer_secs;
     int nc = ble_store_config_num_cccds;
-    mix(&no, sizeof(no)); mix(&np, sizeof(np)); mix(&nc, sizeof(nc));
+    int ni = ble_store_config_num_local_irks;
+    mix(&no, sizeof(no)); mix(&np, sizeof(np)); mix(&nc, sizeof(nc)); mix(&ni, sizeof(ni));
     mix(ble_store_config_our_secs,  sizeof(struct ble_store_value_sec)  * no);
     mix(ble_store_config_peer_secs, sizeof(struct ble_store_value_sec)  * np);
     mix(ble_store_config_cccds,     sizeof(struct ble_store_value_cccd) * nc);
+    mix(ble_store_config_local_irks, sizeof(struct ble_store_value_local_irk) * ni);
     return h;
 }
 
@@ -115,13 +125,16 @@ void bleStoreLoad(void) {
               h.magic    == BLE_STORE_MAGIC &&
               h.secSize  == sizeof(struct ble_store_value_sec) &&
               h.cccdSize == sizeof(struct ble_store_value_cccd) &&
+              h.irkSize  == sizeof(struct ble_store_value_local_irk) &&
               h.nOur  <= CONFIG_BT_NIMBLE_MAX_BONDS &&
               h.nPeer <= CONFIG_BT_NIMBLE_MAX_BONDS &&
-              h.nCccd <= CONFIG_BT_NIMBLE_MAX_CCCDS;
+              h.nCccd <= CONFIG_BT_NIMBLE_MAX_CCCDS &&
+              h.nIrk  <= CONFIG_BT_NIMBLE_MAX_BONDS;
     if (ok) {
         ok = fs_read(ble_store_config_our_secs,  sizeof(struct ble_store_value_sec),  h.nOur,  f) == h.nOur
           && fs_read(ble_store_config_peer_secs, sizeof(struct ble_store_value_sec),  h.nPeer, f) == h.nPeer
-          && fs_read(ble_store_config_cccds,     sizeof(struct ble_store_value_cccd), h.nCccd, f) == h.nCccd;
+          && fs_read(ble_store_config_cccds,     sizeof(struct ble_store_value_cccd), h.nCccd, f) == h.nCccd
+          && fs_read(ble_store_config_local_irks, sizeof(struct ble_store_value_local_irk), h.nIrk, f) == h.nIrk;
     }
     fs_close(f);
     if (!ok) {
@@ -130,9 +143,10 @@ void bleStoreLoad(void) {
         s_lastHash = snapshotHash();
         return;
     }
-    ble_store_config_num_our_secs  = h.nOur;
-    ble_store_config_num_peer_secs = h.nPeer;
-    ble_store_config_num_cccds     = h.nCccd;
+    ble_store_config_num_our_secs   = h.nOur;
+    ble_store_config_num_peer_secs  = h.nPeer;
+    ble_store_config_num_cccds      = h.nCccd;
+    ble_store_config_num_local_irks = h.nIrk;
     s_lastHash = snapshotHash();
     if (h.nOur)
         info("bond store: %u bond%s restored", h.nOur, h.nOur == 1 ? "" : "s");
@@ -149,9 +163,11 @@ static void persistNow(void) {
     h.magic    = BLE_STORE_MAGIC;
     h.secSize  = (uint16_t)sizeof(struct ble_store_value_sec);
     h.cccdSize = (uint16_t)sizeof(struct ble_store_value_cccd);
+    h.irkSize  = (uint16_t)sizeof(struct ble_store_value_local_irk);
     h.nOur     = (uint8_t)ble_store_config_num_our_secs;
     h.nPeer    = (uint8_t)ble_store_config_num_peer_secs;
     h.nCccd    = (uint8_t)ble_store_config_num_cccds;
+    h.nIrk     = (uint8_t)ble_store_config_num_local_irks;
 
     /* Write-then-rename, so a crash mid-write leaves the previous file. */
     int f = fs_open(BLE_STORE_FILE ".new", "wb");
@@ -159,7 +175,8 @@ static void persistNow(void) {
     bool ok = fs_write(&h, sizeof(h), 1, f) == 1
            && fs_write(ble_store_config_our_secs,  sizeof(struct ble_store_value_sec),  h.nOur,  f) == h.nOur
            && fs_write(ble_store_config_peer_secs, sizeof(struct ble_store_value_sec),  h.nPeer, f) == h.nPeer
-           && fs_write(ble_store_config_cccds,     sizeof(struct ble_store_value_cccd), h.nCccd, f) == h.nCccd;
+           && fs_write(ble_store_config_cccds,     sizeof(struct ble_store_value_cccd), h.nCccd, f) == h.nCccd
+           && fs_write(ble_store_config_local_irks, sizeof(struct ble_store_value_local_irk), h.nIrk, f) == h.nIrk;
     fs_close(f);
     if (!ok || fs_rename(BLE_STORE_FILE ".new", BLE_STORE_FILE) != 0) {
         /* s_lastHash stays stale, so the next change persists everything. */

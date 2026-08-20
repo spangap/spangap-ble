@@ -38,6 +38,10 @@ kconfig:
   - CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
   - CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
   - CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+  # Address privacy (resolvable private addresses over a persisted IRK) is
+  # enabled in esp-idf/project_include.cmake, NOT here: the Kconfig option is
+  # gated to the original ESP32 target, so the MYNEWT values are predefined at
+  # project scope instead. See addrGenerate() in src/ble.cpp.
   # The connection budget bleSlotReserve() hands out (IDF default 3, range
   # 1-9). Four, not the protocol's eight: the controller's internal-DRAM
   # appetite — above all its exchange-memory arena, which scales with the

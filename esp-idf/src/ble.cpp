@@ -373,20 +373,51 @@ static bool hostStart(void) {
     return true;
 }
 
-/* A fresh NON-RESOLVABLE PRIVATE address at every host start, after every
- * disconnect, and at latest every BLE_ADDR_ROTATE_MS idle. Peers key
- * per-address state by our address and clean it unreliably; a fresh address
- * per connection — what phones' radios do natively — means stale entries on
- * the far side can never match us twice. Non-resolvable for its top bits
- * (00, below every phone's resolvable 01 and any random static 11): a
- * consumer electing roles by address comparison takes the dialling side
- * against phones. Cost: rotation strands bonds, until this straddle grows
- * resolvable-private-address privacy (an IRK distributed at bonding). */
+/* esp-nimble keeps this in a private header (ble_hs_resolv_priv.h); the
+ * symbol is exported from the archive. Regenerates the local RPA and sets it
+ * in the controller — the host-based-privacy analogue of set_rnd. */
+extern "C" int ble_hs_gen_own_private_rnd(void);
+
+/* True once ble_hs_pvcy_rpa_config() succeeded for the current host run;
+ * cleared at host stop, since a restart reinitialises the privacy machinery. */
+static bool s_pvcyOn = false;
+
+/* A fresh RESOLVABLE private address at every host start, after every
+ * disconnect, and at latest every BLE_ADDR_ROTATE_MS idle — the cadence
+ * non-resolvable rotation had, because peers key per-address state by our
+ * address and clean it unreliably; a fresh address per connection — what
+ * phones' radios do natively — means stale entries on the far side can never
+ * match us twice. The difference privacy makes is that a BONDED peer holds
+ * the identity resolving key (NimBLE distributes it at SMP key exchange, and
+ * it persists with the bonds) and resolves every rotation back to one
+ * identity, so bonds survive what used to strand them; strangers still see
+ * an unlinkable fresh address. esp-nimble's host-based privacy keeps the
+ * generation in the host — the RPA rides the ordinary set-random-address
+ * route, own_addr_type stays BLE_OWN_ADDR_RANDOM everywhere, and this code
+ * always knows the current value. The identity a bond records is the chip's
+ * public address, stable across reboots for free.
+ *
+ * Cost, accepted: an RPA's top bits are 01, the same as every phone's, so a
+ * consumer electing who-dials by address comparison gets a coin flip per
+ * rotation window instead of the old always-we-dial (non-resolvable 00 sat
+ * below everything). Falls back to the old non-resolvable rotation — fresh
+ * addresses, stranded bonds — if privacy fails to start. */
 static bool addrGenerate(void) {
-    ble_addr_t rnd;
-    if (ble_hs_id_gen_rnd(1, &rnd) != 0 || ble_hs_id_set_rnd(rnd.val) != 0)
+    if (!s_pvcyOn && ble_hs_pvcy_rpa_config(NIMBLE_HOST_ENABLE_RPA) == 0) {
+        s_pvcyOn = true;
+        /* A first boot just minted the IRK through the store callbacks; the
+         * persist path diffs, so this is free when it already existed. */
+        bleStoreDirty();
+    } else if (s_pvcyOn && ble_hs_gen_own_private_rnd() != 0) {
         return false;
-    std::memcpy(s_ownAddr, rnd.val, 6);
+    }
+    if (!s_pvcyOn) {
+        ble_addr_t rnd;
+        if (ble_hs_id_gen_rnd(1, &rnd) != 0 || ble_hs_id_set_rnd(rnd.val) != 0)
+            return false;
+    }
+    if (ble_hs_id_copy_addr(BLE_ADDR_RANDOM, s_ownAddr, nullptr) != 0)
+        return false;
     s_ownAddrType = BLE_OWN_ADDR_RANDOM;
     return true;
 }
@@ -427,6 +458,7 @@ static void hostStop(void) {
     s_hostStarted = false;
     s_hostUp = false;
     s_synced = false;
+    s_pvcyOn = false;        /* a restart reinitialises the privacy machinery */
     ctrlReserveGrab();       /* earmark the freed RAM for the next start */
     bleGapOnHostDown();
     info("stopped");
@@ -844,6 +876,24 @@ static void bleTaskMain(void*) {
             xSemaphoreGive(s_lock);
             if (fAll)      bleForgetAllNow();
             else if (fOne) bleForgetNow(fAddr);
+
+            /* NimBLE's own privacy timer regenerates the RPA underneath us
+             * (preempting and restoring adv+scan itself). Adopt the new value
+             * and refire BLE_EV_UP so consumers' copies follow. */
+            uint8_t curAddr[6];
+            if (s_pvcyOn
+                    && ble_hs_id_copy_addr(BLE_ADDR_RANDOM, curAddr, nullptr) == 0
+                    && std::memcmp(curAddr, s_ownAddr, 6) != 0) {
+                std::memcpy(s_ownAddr, curAddr, 6);
+                s_lastRotateMs = millis();
+                char a[20]; bleFmtAddr(s_ownAddr, a, sizeof(a));
+                info("address rotated (privacy timer): now %s", a);
+                ble_event_t ev = {};
+                ev.event = BLE_EV_UP;
+                std::memcpy(ev.addr, s_ownAddr, 6);
+                ev.addrType = s_ownAddrType;
+                bleFire(&ev);
+            }
 
             /* The controller refuses LE Set Random Address while advertising,
              * scanning or a pending connect uses it, so those stop first and

@@ -75,21 +75,26 @@ characteristics carry an encryption flag forces pairing; one whose do not never
 raises a pairing dialog. New bonds are accepted **only inside the pairing
 window**; existing bonds reconnect whenever they like.
 
-**The adapter address rotates.** Every host start generates a fresh
-non-resolvable private address, every disconnect generates another, and a
-15-minute timer covers the idle case. Phones mint a fresh address per
-connection attempt, and per-disconnect rotation is the same protection: peers
-key per-address state by our address (dedupe sets, role flags, back-off
-lists), and a device that presents the same address twice reconnects into
-whatever stale entries the peer failed to clean in between. Non-resolvable rather
-than random static for its top bits (00, below every phone's resolvable
-private address at 01), so a consumer electing roles by address comparison
-takes the dialling side against phones. `bleOwnAddr()` returns the current
-address and `BLE_EV_UP` fires again whenever it changes; live connections
-survive a rotation. The cost is that a bonded peer records the address, so a
-rotation strands the bond: bond-dependent consumers do not survive one until
-this straddle grows resolvable-private-address privacy (an identity resolving
-key distributed at bonding, letting bonded peers resolve every new address).
+**The adapter address rotates, resolvably.** The on-air address is a
+resolvable private address derived from a persisted identity resolving key,
+and it still rotates — at every host start, after every disconnect, and at
+latest every 15 minutes idle. Phones mint a fresh address per connection
+attempt, and per-disconnect rotation is the same protection: peers key
+per-address state by our address (dedupe sets, role flags, back-off lists),
+and a device that presents the same address twice reconnects into whatever
+stale entries the peer failed to clean in between. What the key adds is that a
+**bonded** peer receives it at pairing and resolves every rotation back to one
+identity, so bonds survive rotation and reboot alike (the key persists with
+the bonds in `/state/ble/bonds.bin` — losing it would strand every bond, so
+they live or die together); strangers still see an unlinkable fresh address.
+`bleOwnAddr()` returns the current address and `BLE_EV_UP` fires again
+whenever it changes; live connections survive a rotation. The cost is the
+election thumb: a resolvable address carries top bits 01, the same as every
+phone's, so a consumer electing roles by address comparison now gets a coin
+flip against phones per rotation window instead of the old guaranteed
+dialling side (the non-resolvable 00 prefix sorted below everything). If
+privacy fails to start, the old non-resolvable rotation is the fallback —
+fresh addresses, stranded bonds.
 
 ### Starts automatically
 
